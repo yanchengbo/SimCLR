@@ -14,26 +14,19 @@ from utils import accuracy, save_json, save_linear_eval_history_plot
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Linear evaluation for SimCLR checkpoints")
-    parser.add_argument("--data", default="./datasets", type=str, help="dataset root")
+    parser = argparse.ArgumentParser(description="Supervised-from-scratch baseline for low-label evaluation")
+    parser.add_argument("--data", default="./datasets", type=str)
     parser.add_argument("--dataset-name", default="cifar10", choices=["cifar10", "stl10"])
     parser.add_argument("--arch", default="resnet18", choices=["resnet18", "resnet50"])
-    parser.add_argument("--checkpoint-path", required=True, type=str, help="SimCLR checkpoint path")
     parser.add_argument("--batch-size", default=256, type=int)
     parser.add_argument("--workers", default=0, type=int)
-    parser.add_argument("--epochs", default=20, type=int)
+    parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--lr", default=1e-3, type=float)
     parser.add_argument("--weight-decay", default=0.0, type=float)
     parser.add_argument("--label-fraction", default=1.0, type=float)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--disable-cuda", action="store_true")
-    parser.add_argument("--output-dir", default=None, type=str)
-    parser.add_argument(
-        "--train-mode",
-        default="linear",
-        choices=["linear", "finetune"],
-        help="linear freezes the encoder and trains only the classifier; finetune updates the full network",
-    )
+    parser.add_argument("--output-dir", required=True, type=str)
     args = parser.parse_args()
     if not 0 < args.label_fraction <= 1.0:
         parser.error("--label-fraction must be in the range (0, 1].")
@@ -52,26 +45,6 @@ def build_model(arch):
         return model_fn(weights=None, num_classes=10)
     except TypeError:
         return model_fn(pretrained=False, num_classes=10)
-
-
-def load_encoder_weights(model, checkpoint_path, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    checkpoint_state = checkpoint["state_dict"]
-    encoder_state = {}
-
-    # 1. Load only the ResNet encoder and ignore projection-head weights.
-    for key, value in checkpoint_state.items():
-        if key.startswith("backbone.") and not key.startswith("backbone.fc"):
-            encoder_state[key[len("backbone."):]] = value
-
-    load_result = model.load_state_dict(encoder_state, strict=False)
-    expected_missing = {"fc.weight", "fc.bias"}
-    if set(load_result.missing_keys) != expected_missing:
-        raise RuntimeError(f"Unexpected missing keys: {load_result.missing_keys}")
-    if load_result.unexpected_keys:
-        raise RuntimeError(f"Unexpected keys: {load_result.unexpected_keys}")
-
-    return checkpoint
 
 
 def get_dataset_targets(dataset):
@@ -93,7 +66,7 @@ def build_subset(dataset, label_fraction, seed):
     if label_fraction >= 1.0:
         return dataset
 
-    # 1. Select the same fraction from every class for low-label evaluation.
+    # 1. Keep the same label fraction from every class.
     rng = random.Random(seed)
     class_to_indices = {}
     for index, label in enumerate(get_dataset_targets(dataset)):
@@ -119,7 +92,7 @@ def build_dataset(args, train, transform):
 
 
 def build_dataloaders(args):
-    # 1. Use the same simple input transform for linear and fine-tune runs.
+    # 1. Match the input protocol used by linear_eval.py for fair comparison.
     transform = transforms.ToTensor()
     full_train_dataset = build_dataset(args, train=True, transform=transform)
     test_dataset = build_dataset(args, train=False, transform=transform)
@@ -145,27 +118,6 @@ def build_dataloaders(args):
         "test_examples": len(test_dataset),
     }
     return train_loader, test_loader, dataset_stats
-
-
-def configure_trainable_parameters(model, train_mode):
-    if train_mode == "linear":
-        # 1. Freeze the encoder and train only the final classifier.
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad = name in {"fc.weight", "fc.bias"}
-        return model.fc.parameters()
-
-    # 2. Fine-tuning updates both the encoder and classifier.
-    for parameter in model.parameters():
-        parameter.requires_grad = True
-    return model.parameters()
-
-
-def set_model_mode(model, train_mode):
-    model.train()
-    if train_mode == "linear":
-        for module_name, module in model.named_children():
-            if module_name != "fc":
-                module.eval()
 
 
 def evaluate(model, data_loader, criterion, device):
@@ -194,24 +146,22 @@ def evaluate(model, data_loader, criterion, device):
     }
 
 
-def train_classifier(model, train_loader, test_loader, args, device):
+def train(model, train_loader, test_loader, args, device):
     criterion = nn.CrossEntropyLoss().to(device)
-    trainable_parameters = configure_trainable_parameters(model, args.train_mode)
-    optimizer = torch.optim.Adam(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history = []
-    mode_label = "Linear eval" if args.train_mode == "linear" else "Fine-tune eval"
 
     for epoch in range(args.epochs):
-        set_model_mode(model, args.train_mode)
+        model.train()
         total_train_loss = 0.0
         total_train_top1 = 0.0
         num_batches = 0
 
-        for images, labels in tqdm(train_loader, desc=f"{mode_label} epoch {epoch + 1}/{args.epochs}"):
+        for images, labels in tqdm(train_loader, desc=f"Supervised baseline epoch {epoch + 1}/{args.epochs}"):
             images = images.to(device)
             labels = labels.to(device)
 
-            # 1. Train either the classifier only or the full network.
+            # 1. Train the full supervised model from random initialization.
             optimizer.zero_grad()
             logits = model(images)
             loss = criterion(logits, labels)
@@ -223,13 +173,11 @@ def train_classifier(model, train_loader, test_loader, args, device):
             total_train_top1 += top1[0].item()
             num_batches += 1
 
-        train_loss = total_train_loss / num_batches
-        train_top1 = total_train_top1 / num_batches
         test_metrics = evaluate(model, test_loader, criterion, device)
         epoch_metrics = {
             "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "train_top1": train_top1,
+            "train_loss": total_train_loss / num_batches,
+            "train_top1": total_train_top1 / num_batches,
             "test_top1": test_metrics["top1"],
             "test_top5": test_metrics["top5"],
             "test_loss": test_metrics["loss"],
@@ -237,7 +185,7 @@ def train_classifier(model, train_loader, test_loader, args, device):
         history.append(epoch_metrics)
         print(
             f"Epoch {epoch + 1}\t"
-            f"Train Top1 {train_top1:.2f}\t"
+            f"Train Top1 {epoch_metrics['train_top1']:.2f}\t"
             f"Test Top1 {test_metrics['top1']:.2f}\t"
             f"Test Top5 {test_metrics['top5']:.2f}"
         )
@@ -258,53 +206,36 @@ def main():
 
     train_loader, test_loader, dataset_stats = build_dataloaders(args)
     model = build_model(args.arch).to(device)
-    checkpoint = load_encoder_weights(model, args.checkpoint_path, device)
-
-    history = train_classifier(model, train_loader, test_loader, args, device)
+    history = train(model, train_loader, test_loader, args, device)
     best_epoch = max(history, key=lambda item: item["test_top1"])
 
     result = {
-        "checkpoint_path": os.path.abspath(args.checkpoint_path),
+        "method": "supervised_from_scratch",
         "dataset_name": args.dataset_name,
         "label_fraction": args.label_fraction,
         "epochs": args.epochs,
         "arch": args.arch,
-        "train_mode": args.train_mode,
-        "encoder_frozen": args.train_mode == "linear",
         "dataset_stats": dataset_stats,
-        "checkpoint_metadata": {
-            "use_projection_head": checkpoint.get("use_projection_head"),
-            "augmentation": checkpoint.get("augmentation"),
-            "aug_strength": checkpoint.get("aug_strength"),
-            "feature_dim": checkpoint.get("feature_dim"),
-            "projection_dim": checkpoint.get("projection_dim"),
-        },
+        "optimizer": "Adam",
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "seed": args.seed,
         "best_epoch": best_epoch,
         "history": history,
     }
 
-    if args.output_dir is None:
-        checkpoint_dir = os.path.dirname(os.path.abspath(args.checkpoint_path))
-        checkpoint_name = os.path.splitext(os.path.basename(args.checkpoint_path))[0]
-        args.output_dir = os.path.join(
-            checkpoint_dir,
-            f"{args.train_mode}_eval_{checkpoint_name}_labels_{args.label_fraction}",
-        )
-
     os.makedirs(args.output_dir, exist_ok=True)
     result_path = os.path.join(args.output_dir, "results.json")
     save_json(result, result_path)
-
-    plot_path = os.path.join(args.output_dir, "linear_eval_curves.png")
+    plot_path = os.path.join(args.output_dir, "supervised_baseline_curves.png")
     save_linear_eval_history_plot(
         history,
         plot_path,
-        f"{args.train_mode.title()} Evaluation ({args.arch}, labels={args.label_fraction})",
+        f"Supervised From Scratch ({args.arch}, labels={args.label_fraction})",
     )
-
     print(f"Best Test Top1: {best_epoch['test_top1']:.2f}")
-    print(f"Saved linear evaluation results to {result_path}")
-    print(f"Saved linear evaluation curves to {plot_path}")
+    print(f"Saved supervised baseline results to {result_path}")
+    print(f"Saved supervised baseline curves to {plot_path}")
 
 
 if __name__ == "__main__":

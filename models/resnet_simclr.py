@@ -7,52 +7,55 @@ from exceptions.exceptions import InvalidBackboneError
 class ResNetSimCLR(nn.Module):
 
     def __init__(self, base_model, out_dim, use_projection_head=True):
-        """
-        初始化 SimCLR 模型
-
-        :param base_model: backbone 的名称 (resnet18 或 resnet50)
-        :param out_dim: 最终输出特征维度 (projection head 的输出维度)
-        :param use_projection_head: 是否使用两层 MLP projection head
-        """
         super(ResNetSimCLR, self).__init__()
-        # 定义可选的 ResNet 模型字典
-        self.resnet_dict = {"resnet18": models.resnet18(pretrained=False, num_classes=out_dim),
-                            "resnet50": models.resnet50(pretrained=False, num_classes=out_dim)}
-        # 获取 backbone 模型
+        self.resnet_dict = {
+            "resnet18": models.resnet18,
+            "resnet50": models.resnet50,
+        }
         self.backbone = self._get_basemodel(base_model)
-        # 获取 ResNet 最后一层全连接层的输入维度
-        dim_mlp = self.backbone.fc.in_features
-        if use_projection_head:
-            # Linear(dim_mlp -> dim_mlp) -> ReLU -> Linear(dim_mlp -> out_dim)
-            self.backbone.fc = nn.Sequential(
-                nn.Linear(dim_mlp, dim_mlp),
+        self.feature_dim = self.backbone.fc.in_features
+        self.use_projection_head = use_projection_head
+
+        # 1. Keep the encoder output h separate from the projection output z.
+        self.backbone.fc = nn.Identity()
+        if self.use_projection_head:
+            self.projection_head = nn.Sequential(
+                nn.Linear(self.feature_dim, self.feature_dim),
                 nn.ReLU(),
-                self.backbone.fc
-                )
+                nn.Linear(self.feature_dim, out_dim),
+            )
+            self.projection_dim = out_dim
         else:
-            # 无 projection head 时，直接使用 encoder 表征参与对比损失。
-            self.backbone.fc = nn.Identity()
+            self.projection_head = nn.Identity()
+            self.projection_dim = self.feature_dim
+
+    @staticmethod
+    def _build_resnet(model_fn):
+        try:
+            return model_fn(weights=None)
+        except TypeError:
+            return model_fn(pretrained=False)
 
     def _get_basemodel(self, model_name):
-        """
-        根据名称获取 ResNet 模型
-
-        :param model_name: 模型名称
-        :return: 对应的 ResNet 模型
-        """
         try:
-            model = self.resnet_dict[model_name]
+            model_fn = self.resnet_dict[model_name]
         except KeyError:
             raise InvalidBackboneError(
-                "Invalid backbone architecture. Check the config file and pass one of: resnet18 or resnet50")
-        else:
-            return model
+                "Invalid backbone architecture. Use one of: resnet18 or resnet50."
+            )
+        return self._build_resnet(model_fn)
 
-    def forward(self, x):
-        """
-        前向传播
-
-        :param x: 输入图像 (Tensor)
-        :return: 投影后的特征向量
-        """
+    def encode(self, x):
+        """Return encoder features before the projection head."""
         return self.backbone(x)
+
+    def project(self, features):
+        """Return features used by the contrastive loss."""
+        return self.projection_head(features)
+
+    def forward(self, x, return_embedding=False):
+        embeddings = self.encode(x)
+        projections = self.project(embeddings)
+        if return_embedding:
+            return embeddings, projections
+        return projections

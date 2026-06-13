@@ -1,15 +1,20 @@
-import logging
 import csv
-import json
+import logging
 import os
-import sys
 
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm # 进度条
-from utils import save_config_file, accuracy, save_checkpoint
+from tqdm import tqdm
+
+from utils import (
+    accuracy,
+    save_checkpoint,
+    save_config_file,
+    save_json,
+    save_simclr_history_plot,
+)
 
 torch.manual_seed(0)
 
@@ -17,181 +22,210 @@ torch.manual_seed(0)
 class SimCLR(object):
 
     def __init__(self, *args, **kwargs):
-        """
-        初始化 SimCLR 模型训练器
-
-        kwargs 中传入：
-        - args: 训练参数
-        - model: 模型
-        - optimizer: 优化器
-        - scheduler: 学习率调度器
-        """
-        self.args = kwargs['args']
-        self.model = kwargs['model'].to(self.args.device)
-        self.optimizer = kwargs['optimizer']
-        self.scheduler = kwargs['scheduler']
-        # TensorBoard 日志记录
+        self.args = kwargs["args"]
+        self.model = kwargs["model"].to(self.args.device)
+        self.optimizer = kwargs["optimizer"]
+        self.scheduler = kwargs["scheduler"]
         self.writer = SummaryWriter(log_dir=self.args.run_dir)
         os.makedirs(self.writer.log_dir, exist_ok=True)
         logging.basicConfig(
-            filename=os.path.join(self.writer.log_dir, 'training.log'), 
-            level=logging.DEBUG
-            )
-        # 交叉熵损失函数 -> 在 SimCLR 中，最终会把 "对比学习" 转成 "分类任务"
+            filename=os.path.join(self.writer.log_dir, "training.log"),
+            level=logging.DEBUG,
+        )
         self.criterion = torch.nn.CrossEntropyLoss().to(self.args.device)
 
-    def info_nce_loss(self, features):
-        """
-        计算 SimCLR 中的 InfoNCE Loss 所需的 logits 和 labels
+    def _current_lr(self):
+        if hasattr(self.scheduler, "get_last_lr"):
+            return float(self.scheduler.get_last_lr()[0])
+        return float(self.scheduler.get_lr()[0])
 
-        :param features: 模型输出的特征，形状一般为 [2 * batch_size, feature_dim]
-        :return:
-            logits: 相似度得分
-            labels: 正样本标签
-        """
-        # 1. 构造标签矩阵
+    def info_nce_loss(self, features):
+        """Build logits and labels for the NT-Xent contrastive loss."""
+        # 1. Mark the two augmented views from the same image as positives.
         labels = torch.cat(
-            [torch.arange(self.args.batch_size) for i in range(self.args.n_views)], dim=0)
-        # 通过两两比较生成一个布尔矩阵 -> 若样本 i 和样本 j 来自同一张原图, 则为 True; 否则为 False
+            [torch.arange(self.args.batch_size) for _ in range(self.args.n_views)],
+            dim=0,
+        )
         labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
         labels = labels.to(self.args.device)
-        # 2. 特征归一化
+
+        # 2. Normalize features and compute all pair similarities.
         features = F.normalize(features, dim=1)
-        # 3. 计算相似度矩阵
         similarity_matrix = torch.matmul(features, features.T)
 
-        # 原作者断言, 方便调试时检查维度: 
-        # assert similarity_matrix.shape == (
-        #     self.args.n_views * self.args.batch_size, self.args.n_views * self.args.batch_size)
-        # assert similarity_matrix.shape == labels.shape
-
-        # 4. 去掉对角线元素 -> 对角线元素是样本与自身的相似度, 没有意义不参与训练
+        # 3. Remove self-similarity on the diagonal.
         mask = torch.eye(labels.shape[0], dtype=torch.bool).to(self.args.device)
         labels = labels[~mask].view(labels.shape[0], -1)
         similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
 
-        # 原作者断言, 方便调试时检查维度: 
-        # assert similarity_matrix.shape == labels.shape
-
-        # 5. 提取正样本对 -> labels.bool() 为 True 的位置, 就是正样本
+        # 4. Put the positive logit first, followed by all negative logits.
         positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
-        # 6. 提取负样本对 -> labels.bool() 为 False 的位置, 就是负样本
         negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
-        # 7. 拼接 logits -> 按照 [正样本 | 负样本] 的顺序拼接
         logits = torch.cat([positives, negatives], dim=1)
-        # 构造监督标签 -> 因为每一行的第 0 列是正样本，所以目标标签全是 0
+
+        # 5. The positive class is always column 0 after concatenation.
         labels = torch.zeros(logits.shape[0], dtype=torch.long).to(self.args.device)
-        # 8. 温度缩放 -> 除以温度参数来调整 logits 分布, 使模型更容易学习区分正负样本的能力
         logits = logits / self.args.temperature
         return logits, labels
 
     def train(self, train_loader):
-        """
-        执行训练流程
-
-        :param train_loader: 训练数据加载器
-        """
-        # 混合精度训练的梯度缩放器, 如果 fp16_precision=False 则不起作用
+        """Run SimCLR pretraining and save checkpoint files."""
         scaler = GradScaler(enabled=self.args.fp16_precision)
-        # save config file
         save_config_file(self.writer.log_dir, self.args)
 
-        n_iter = 0 # 迭代步数
-        epoch_metrics = []
+        n_iter = 0
+        history = []
         logging.info(f"Start SimCLR training for {self.args.epochs} epochs.")
-        logging.info(f"Training with gpu: {self.args.disable_cuda}.")
+        logging.info(f"CUDA disabled: {self.args.disable_cuda}.")
 
-        # 循环 epoch
         for epoch_counter in range(self.args.epochs):
-            epoch_loss_total = 0.0
-            epoch_top1_total = 0.0
-            epoch_top5_total = 0.0
-            epoch_steps = 0
-            for images, _ in tqdm(train_loader):
-                # [batch_size, C, H, W] -> [2 * batch_size, C, H, W]
+            total_loss = 0.0
+            total_top1 = 0.0
+            total_top5 = 0.0
+            num_batches = 0
+
+            for images, _ in tqdm(train_loader, desc=f"SimCLR epoch {epoch_counter + 1}/{self.args.epochs}"):
+                # 1. Stack two views into one batch of shape [2B, C, H, W].
                 images = torch.cat(images, dim=0)
                 images = images.to(self.args.device)
 
-                # 前向传播, autocast 用于自动混合精度
+                # 2. Apply the contrastive loss to projection features z.
                 with autocast(enabled=self.args.fp16_precision):
-                    features = self.model(images) # 模型提取特征
-                    logits, labels = self.info_nce_loss(features) # 计算 InfoNCE 所需的 logits 和 labels
-                    loss = self.criterion(logits, labels) # 用交叉熵计算损失
+                    _, projections = self.model(images, return_embedding=True)
+                    logits, labels = self.info_nce_loss(projections)
+                    loss = self.criterion(logits, labels)
 
-                # 梯度清零
+                # 3. Update model parameters.
                 self.optimizer.zero_grad()
-                # 反向传播
                 scaler.scale(loss).backward()
-                # 参数更新
                 scaler.step(self.optimizer)
                 scaler.update()
-                # 计算 top1 / top5 准确率 -> 看正样本是否排在前 1 或前 5
+
                 top1, top5 = accuracy(logits, labels, topk=(1, 5))
                 loss_value = float(loss.item())
                 top1_value = float(top1[0].item())
                 top5_value = float(top5[0].item())
-                epoch_loss_total += loss_value
-                epoch_top1_total += top1_value
-                epoch_top5_total += top5_value
-                epoch_steps += 1
-                # 定期记录训练日志
-                if n_iter % self.args.log_every_n_steps == 0:
-                    self.writer.add_scalar('loss', loss_value, global_step=n_iter)
-                    self.writer.add_scalar('acc/top1', top1_value, global_step=n_iter)
-                    self.writer.add_scalar('acc/top5', top5_value, global_step=n_iter)
-                    self.writer.add_scalar('learning_rate', self.scheduler.get_lr()[0], global_step=n_iter)
+                total_loss += loss_value
+                total_top1 += top1_value
+                total_top5 += top5_value
+                num_batches += 1
 
+                if n_iter % self.args.log_every_n_steps == 0:
+                    self.writer.add_scalar("loss", loss_value, global_step=n_iter)
+                    self.writer.add_scalar("acc/top1", top1_value, global_step=n_iter)
+                    self.writer.add_scalar("acc/top5", top5_value, global_step=n_iter)
+                    self.writer.add_scalar("learning_rate", self._current_lr(), global_step=n_iter)
                 n_iter += 1
 
-            # 前 10 epoch 不调整学习率, 之后开始使用 scheduler
+            # 4. Keep the original 10-epoch warmup behavior from this project.
             if epoch_counter >= 10:
                 self.scheduler.step()
-            epoch_summary = {
-                'epoch': epoch_counter + 1,
-                'loss': epoch_loss_total / max(epoch_steps, 1),
-                'top1': epoch_top1_total / max(epoch_steps, 1),
-                'top5': epoch_top5_total / max(epoch_steps, 1),
-                'learning_rate': float(self.optimizer.param_groups[0]['lr']),
+
+            epoch_metrics = {
+                "epoch": epoch_counter + 1,
+                "train_loss": total_loss / max(num_batches, 1),
+                "train_top1": total_top1 / max(num_batches, 1),
+                "train_top5": total_top5 / max(num_batches, 1),
+                "learning_rate": self._current_lr(),
             }
-            epoch_metrics.append(epoch_summary)
+            history.append(epoch_metrics)
+            self.writer.add_scalar("epoch/loss", epoch_metrics["train_loss"], global_step=epoch_counter + 1)
+            self.writer.add_scalar("epoch/top1", epoch_metrics["train_top1"], global_step=epoch_counter + 1)
+            self.writer.add_scalar("epoch/top5", epoch_metrics["train_top5"], global_step=epoch_counter + 1)
+            self.writer.add_scalar(
+                "epoch/learning_rate",
+                epoch_metrics["learning_rate"],
+                global_step=epoch_counter + 1,
+            )
             logging.debug(
-                f"Epoch: {epoch_counter + 1}\tLoss: {epoch_summary['loss']}\tTop1 accuracy: {epoch_summary['top1']}")
+                f"Epoch: {epoch_counter + 1}\t"
+                f"Loss: {epoch_metrics['train_loss']:.4f}\t"
+                f"Top1 accuracy: {epoch_metrics['train_top1']:.2f}\t"
+                f"Top5 accuracy: {epoch_metrics['train_top5']:.2f}"
+            )
+            print(
+                f"Epoch {epoch_counter + 1}\t"
+                f"Train Loss {epoch_metrics['train_loss']:.4f}\t"
+                f"Train Top1 {epoch_metrics['train_top1']:.2f}\t"
+                f"Train Top5 {epoch_metrics['train_top5']:.2f}"
+            )
 
         logging.info("Training has finished.")
-        # 保存模型检查点
-        checkpoint_name = 'checkpoint_{:04d}.pth.tar'.format(self.args.epochs)
-        save_checkpoint({
-            'epoch': self.args.epochs,
-            'arch': self.args.arch,
-            'state_dict': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-        }, is_best=False, filename=os.path.join(self.writer.log_dir, checkpoint_name))
-        logging.info(f"Model checkpoint and metadata has been saved at {self.writer.log_dir}.")
-        metrics_csv_path = os.path.join(self.writer.log_dir, 'metrics.csv')
-        with open(metrics_csv_path, 'w', newline='') as outfile:
+        return self._save_outputs(history)
+
+    def _save_outputs(self, history):
+        checkpoint_name = "checkpoint_{:04d}.pth.tar".format(self.args.epochs)
+        checkpoint_path = os.path.join(self.writer.log_dir, checkpoint_name)
+        augmentation = getattr(self.args, "augmentation", None)
+
+        save_checkpoint(
+            {
+                "epoch": self.args.epochs,
+                "arch": self.args.arch,
+                "augmentation": augmentation,
+                "aug_strength": augmentation,
+                "use_projection_head": self.args.use_projection_head,
+                "feature_dim": getattr(self.model, "feature_dim", None),
+                "projection_dim": getattr(self.model, "projection_dim", None),
+                "state_dict": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+            },
+            is_best=False,
+            filename=checkpoint_path,
+        )
+
+        metrics_csv_path = os.path.join(self.writer.log_dir, "metrics.csv")
+        with open(metrics_csv_path, "w", newline="", encoding="utf-8") as outfile:
             writer = csv.DictWriter(
                 outfile,
-                fieldnames=['epoch', 'loss', 'top1', 'top5', 'learning_rate'])
+                fieldnames=["epoch", "train_loss", "train_top1", "train_top5", "learning_rate"],
+            )
             writer.writeheader()
-            writer.writerows(epoch_metrics)
-        summary = {
-            'dataset_name': self.args.dataset_name,
-            'arch': self.args.arch,
-            'augmentation': self.args.augmentation,
-            'epochs': self.args.epochs,
-            'batch_size': self.args.batch_size,
-            'temperature': self.args.temperature,
-            'seed': self.args.seed,
-            'out_dim': self.args.out_dim,
-            'use_projection_head': self.args.use_projection_head,
-            'checkpoint_path': os.path.join(self.writer.log_dir, checkpoint_name),
-            'metrics_csv_path': metrics_csv_path,
-            'final_loss': epoch_metrics[-1]['loss'],
-            'final_top1': epoch_metrics[-1]['top1'],
-            'final_top5': epoch_metrics[-1]['top5'],
-            'epoch_metrics': epoch_metrics,
+            writer.writerows(history)
+
+        history_payload = {
+            "run_name": self.args.run_name,
+            "run_dir": os.path.abspath(self.writer.log_dir),
+            "epochs": self.args.epochs,
+            "arch": self.args.arch,
+            "dataset_name": self.args.dataset_name,
+            "history": history,
         }
-        with open(os.path.join(self.writer.log_dir, 'summary.json'), 'w') as outfile:
-            json.dump(summary, outfile, indent=2)
+        history_path = os.path.join(self.writer.log_dir, "training_history.json")
+        save_json(history_payload, history_path)
+
+        plot_path = os.path.join(self.writer.log_dir, "training_curves.png")
+        plot_saved = save_simclr_history_plot(history, plot_path, f"SimCLR Training: {self.args.run_name}")
+
+        final_epoch = history[-1] if history else {}
+        summary = {
+            "dataset_name": self.args.dataset_name,
+            "arch": self.args.arch,
+            "augmentation": augmentation,
+            "epochs": self.args.epochs,
+            "batch_size": self.args.batch_size,
+            "temperature": self.args.temperature,
+            "seed": self.args.seed,
+            "out_dim": self.args.out_dim,
+            "use_projection_head": self.args.use_projection_head,
+            "feature_dim": getattr(self.model, "feature_dim", None),
+            "projection_dim": getattr(self.model, "projection_dim", None),
+            "checkpoint_path": checkpoint_path,
+            "metrics_csv_path": metrics_csv_path,
+            "training_history_path": history_path,
+            "training_curves_path": plot_path if plot_saved else None,
+            "final_loss": final_epoch.get("train_loss"),
+            "final_top1": final_epoch.get("train_top1"),
+            "final_top5": final_epoch.get("train_top5"),
+            "epoch_metrics": history,
+        }
+        save_json(summary, os.path.join(self.writer.log_dir, "summary.json"))
+
+        logging.info(f"Model checkpoint and metadata have been saved at {self.writer.log_dir}.")
+        print(f"Saved checkpoint to {checkpoint_path}")
+        print(f"Saved training history to {history_path}")
+        if plot_saved:
+            print(f"Saved training curves to {plot_path}")
+
         self.writer.close()
         return summary

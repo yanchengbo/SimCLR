@@ -1,5 +1,10 @@
+.DS_Store
 .vscode
 .idea
 __pycache__
+datasets
 datasets_local
 runs
+eval
+feature_eval/results
+supervised_low_label_results
